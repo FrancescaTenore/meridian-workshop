@@ -228,12 +228,12 @@ def get_recent_transactions():
     return recent_transactions
 
 @app.get("/api/reports/quarterly")
-def get_quarterly_reports():
+def get_quarterly_reports(warehouse: Optional[str] = None, category: Optional[str] = None):
     """Get quarterly performance reports"""
-    # Calculate quarterly statistics from orders
+    filtered_orders = apply_filters(orders, warehouse=warehouse, category=category)
     quarters = {}
 
-    for order in orders:
+    for order in filtered_orders:
         order_date = order.get('order_date', '')
         # Determine quarter
         if '2025-01' in order_date or '2025-02' in order_date or '2025-03' in order_date:
@@ -274,11 +274,12 @@ def get_quarterly_reports():
     return result
 
 @app.get("/api/reports/monthly-trends")
-def get_monthly_trends():
+def get_monthly_trends(warehouse: Optional[str] = None, category: Optional[str] = None):
     """Get month-over-month trends"""
+    filtered_orders = apply_filters(orders, warehouse=warehouse, category=category)
     months = {}
 
-    for order in orders:
+    for order in filtered_orders:
         order_date = order.get('order_date', '')
         if not order_date:
             continue
@@ -303,6 +304,106 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+PRIORITY_ORDER = {'critical': 0, 'high': 1, 'medium': 2}
+
+@app.get("/api/restocking/recommendations")
+def get_restocking_recommendations(
+    warehouse: Optional[str] = None,
+    category: Optional[str] = None
+):
+    filtered = apply_filters(inventory_items, warehouse=warehouse, category=category)
+
+    demand_lookup = {d['item_sku']: d['forecasted_demand'] for d in demand_forecasts}
+    backlog_skus = {b['item_sku'] for b in backlog_items}
+
+    recommendations = []
+    for item in filtered:
+        sku = item['sku']
+        qty = item.get('quantity_on_hand', 0)
+        reorder_point = item.get('reorder_point', 0)
+        unit_cost = item.get('unit_cost', 0)
+        forecasted_demand = demand_lookup.get(sku)
+
+        below_reorder = qty < reorder_point
+        forecast_risk = forecasted_demand is not None and forecasted_demand > qty
+
+        if not below_reorder and not forecast_risk:
+            continue
+
+        trigger = 'below_reorder' if below_reorder else 'forecast_risk'
+        has_backlog = sku in backlog_skus
+
+        days_to_stockout = None
+        if forecasted_demand and forecasted_demand > 0:
+            days_to_stockout = round((qty * 30) / forecasted_demand, 1)
+
+        target_qty = max(reorder_point, forecasted_demand or 0)
+        recommended_qty = max(target_qty - qty, 1)
+        estimated_cost = round(recommended_qty * unit_cost, 2)
+
+        if days_to_stockout is not None and days_to_stockout < 7 or has_backlog:
+            priority = 'critical'
+        elif (days_to_stockout is not None and days_to_stockout < 14) or below_reorder:
+            priority = 'high'
+        else:
+            priority = 'medium'
+
+        recommendations.append({
+            'sku': sku,
+            'name': item.get('name', ''),
+            'category': item.get('category', ''),
+            'warehouse': item.get('warehouse', ''),
+            'quantity_on_hand': qty,
+            'reorder_point': reorder_point,
+            'unit_cost': unit_cost,
+            'forecasted_demand': forecasted_demand,
+            'days_to_stockout': days_to_stockout,
+            'recommended_qty': recommended_qty,
+            'estimated_cost': estimated_cost,
+            'trigger': trigger,
+            'priority': priority,
+            'has_backlog': has_backlog
+        })
+
+    recommendations.sort(key=lambda x: (
+        PRIORITY_ORDER.get(x['priority'], 99),
+        x['days_to_stockout'] if x['days_to_stockout'] is not None else 9999
+    ))
+    return recommendations
+
+
+class Task(BaseModel):
+    id: str
+    title: str
+    priority: str
+    due_date: Optional[str] = None
+    completed: bool = False
+
+_tasks: list = []
+
+@app.get("/api/tasks")
+def get_tasks():
+    return _tasks
+
+@app.post("/api/tasks", status_code=201)
+def create_task(task: Task):
+    _tasks.append(task.dict())
+    return task
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: str):
+    global _tasks
+    _tasks = [t for t in _tasks if t['id'] != task_id]
+    return {"ok": True}
+
+@app.patch("/api/tasks/{task_id}")
+def toggle_task(task_id: str):
+    for task in _tasks:
+        if task['id'] == task_id:
+            task['completed'] = not task['completed']
+            return task
+    raise HTTPException(status_code=404, detail="Task not found")
 
 if __name__ == "__main__":
     import uvicorn
